@@ -1,0 +1,651 @@
+CREATE OR REPLACE TABLE `binf4008-project-dz.mi_prediction.patient_cohort_features2` AS
+
+WITH acute_mi_admissions AS (
+  SELECT DISTINCT hadm_id
+  FROM `physionet-data.mimiciv_3_1_hosp.diagnoses_icd`
+  WHERE
+    (icd_version = 9 AND icd_code LIKE '410%')
+    OR (icd_version = 10 AND (icd_code LIKE 'I21%' OR icd_code LIKE 'I22%'))
+),
+
+mi_history_admissions AS (
+  SELECT DISTINCT hadm_id
+  FROM `physionet-data.mimiciv_3_1_hosp.diagnoses_icd`
+  WHERE
+    -- acute MI
+    (icd_version = 9 AND icd_code LIKE '410%')
+    OR (icd_version = 10 AND (icd_code LIKE 'I21%' OR icd_code LIKE 'I22%'))
+
+    -- old / prior MI history
+    OR (icd_version = 9 AND icd_code = '412')
+    OR (icd_version = 10 AND icd_code = 'I252')
+),
+
+eligible_admissions AS (
+  SELECT
+    a.subject_id,
+    a.hadm_id,
+    a.admittime,
+    a.dischtime,
+    ROW_NUMBER() OVER (
+      PARTITION BY a.subject_id
+      ORDER BY a.admittime
+    ) AS eligible_rank
+  FROM `physionet-data.mimiciv_3_1_hosp.admissions` a
+  LEFT JOIN acute_mi_admissions mi
+    ON a.hadm_id = mi.hadm_id
+  WHERE mi.hadm_id IS NULL
+),
+
+index_admissions_raw AS (
+  SELECT
+    subject_id,
+    hadm_id AS index_hadm_id,
+    admittime AS index_admittime,
+    dischtime AS index_dischtime
+  FROM eligible_admissions
+  WHERE eligible_rank = 1
+    AND dischtime IS NOT NULL
+),
+
+prior_mi_history AS (
+  SELECT DISTINCT
+    ia.subject_id
+  FROM index_admissions_raw ia
+  JOIN `physionet-data.mimiciv_3_1_hosp.admissions` a
+    ON ia.subject_id = a.subject_id
+   AND a.admittime <= ia.index_admittime
+  JOIN mi_history_admissions mh
+    ON a.hadm_id = mh.hadm_id
+),
+
+vitals_hadm AS (
+  SELECT DISTINCT icu.hadm_id
+  FROM `physionet-data.mimiciv_3_1_derived.first_day_vitalsign` v
+  JOIN `physionet-data.mimiciv_3_1_icu.icustays` icu
+    ON v.stay_id = icu.stay_id
+  WHERE icu.hadm_id IS NOT NULL
+),
+
+labs_hadm AS (
+  SELECT DISTINCT icu.hadm_id
+  FROM `physionet-data.mimiciv_3_1_derived.first_day_lab` l
+  JOIN `physionet-data.mimiciv_3_1_icu.icustays` icu
+    ON l.stay_id = icu.stay_id
+  WHERE icu.hadm_id IS NOT NULL
+),
+
+feature_available AS (
+  SELECT DISTINCT v.hadm_id
+  FROM vitals_hadm v
+  JOIN labs_hadm l
+    ON v.hadm_id = l.hadm_id
+),
+
+index_admissions AS (
+  SELECT i.*
+  FROM index_admissions_raw i
+  JOIN feature_available f
+    ON i.index_hadm_id = f.hadm_id
+  LEFT JOIN prior_mi_history pm
+    ON i.subject_id = pm.subject_id
+  WHERE pm.subject_id IS NULL
+),
+
+index_icu_stay AS (
+  SELECT
+    icu.hadm_id,
+    MIN(icu.stay_id) AS first_stay_id
+  FROM `physionet-data.mimiciv_3_1_icu.icustays` icu
+  JOIN index_admissions ia
+    ON icu.hadm_id = ia.index_hadm_id
+  GROUP BY icu.hadm_id
+),
+
+followup AS (
+  SELECT
+    i.subject_id,
+    i.index_hadm_id,
+    i.index_admittime,
+    i.index_dischtime,
+    CASE
+      WHEN p.dod IS NOT NULL
+       AND p.dod <= DATE(i.index_dischtime)
+      THEN 1 ELSE 0
+    END AS inpatient_death,
+    p.dod,
+    DATE_DIFF(
+      GREATEST(
+        COALESCE(MAX(DATE(a.dischtime)), DATE(i.index_dischtime)),
+        COALESCE(p.dod, DATE '1900-01-01')
+      ),
+      DATE(i.index_dischtime),
+      DAY
+    ) AS followup_days
+  FROM index_admissions i
+  LEFT JOIN `physionet-data.mimiciv_3_1_hosp.admissions` a
+    ON i.subject_id = a.subject_id
+   AND a.hadm_id != i.index_hadm_id
+   AND a.admittime > i.index_dischtime
+  LEFT JOIN `physionet-data.mimiciv_3_1_hosp.patients` p
+    ON i.subject_id = p.subject_id
+  GROUP BY
+    i.subject_id,
+    i.index_hadm_id,
+    i.index_admittime,
+    i.index_dischtime,
+    p.dod
+),
+
+future_mi AS (
+  SELECT
+    i.subject_id,
+    i.index_hadm_id,
+    i.index_dischtime,
+    MIN(DATE(a.admittime)) AS first_future_mi_date,
+    DATE_DIFF(
+      MIN(DATE(a.admittime)),
+      DATE(i.index_dischtime),
+      DAY
+    ) AS days_to_mi
+  FROM index_admissions i
+  JOIN `physionet-data.mimiciv_3_1_hosp.admissions` a
+    ON i.subject_id = a.subject_id
+   AND a.admittime > i.index_dischtime
+  JOIN acute_mi_admissions mi
+    ON a.hadm_id = mi.hadm_id
+  GROUP BY i.subject_id, i.index_hadm_id, i.index_dischtime
+),
+
+prior_admissions AS (
+  SELECT
+    ia.subject_id,
+    ia.index_hadm_id,
+    COUNT(a.hadm_id) AS num_prior_admissions,
+    COUNTIF(a.admittime >= DATETIME_SUB(ia.index_admittime, INTERVAL 365 DAY))
+      AS num_prior_admissions_1yr,
+    DATE_DIFF(
+      DATE(ia.index_admittime),
+      DATE(MAX(a.dischtime)),
+      DAY
+    ) AS days_since_last_admission
+  FROM index_admissions ia
+  LEFT JOIN `physionet-data.mimiciv_3_1_hosp.admissions` a
+    ON ia.subject_id = a.subject_id
+   AND a.admittime < ia.index_admittime
+  GROUP BY ia.subject_id, ia.index_hadm_id, ia.index_admittime
+),
+
+prior_icu_stays AS (
+  SELECT
+    ia.subject_id,
+    ia.index_hadm_id,
+    COUNT(icu.stay_id) AS num_prior_icu_stays
+  FROM index_admissions ia
+  LEFT JOIN `physionet-data.mimiciv_3_1_icu.icustays` icu
+    ON ia.subject_id = icu.subject_id
+   AND icu.intime < ia.index_admittime
+  GROUP BY ia.subject_id, ia.index_hadm_id
+),
+
+demographics AS (
+  SELECT
+    a.subject_id,
+    a.hadm_id,
+    DATETIME_DIFF(
+      a.admittime,
+      DATETIME(p.anchor_year, 1, 1, 0, 0, 0),
+      YEAR
+    ) + p.anchor_age AS age,
+    p.gender,
+    a.race,
+    a.marital_status,
+    a.insurance,
+    a.admission_type,
+    a.discharge_location,
+    DATE_DIFF(DATE(a.dischtime), DATE(a.admittime), DAY) AS los_days
+  FROM `physionet-data.mimiciv_3_1_hosp.admissions` a
+  JOIN `physionet-data.mimiciv_3_1_hosp.patients` p
+    ON a.subject_id = p.subject_id
+),
+
+vitals AS (
+  SELECT
+    iis.hadm_id,
+    v.heart_rate_mean,
+    v.heart_rate_max,
+    v.sbp_mean,
+    v.sbp_min,
+    v.dbp_mean,
+    v.dbp_min,
+    v.mbp_mean,
+    v.mbp_min,
+    v.resp_rate_mean,
+    v.resp_rate_max,
+    v.temperature_mean,
+    v.temperature_max,
+    v.spo2_mean,
+    v.spo2_min
+  FROM `physionet-data.mimiciv_3_1_derived.first_day_vitalsign` v
+  JOIN index_icu_stay iis
+    ON v.stay_id = iis.first_stay_id
+),
+
+labs AS (
+  SELECT
+    iis.hadm_id,
+    l.hematocrit_min,
+    l.hemoglobin_min,
+    l.platelets_min,
+    l.wbc_max,
+    l.bicarbonate_min,
+    l.bun_max,
+    l.calcium_min,
+    l.chloride_min,
+    l.creatinine_max,
+    l.glucose_max,
+    l.sodium_min,
+    l.potassium_max,
+    l.aniongap_max,
+    l.albumin_min,
+    l.bilirubin_total_max,
+    l.inr_max,
+    l.pt_max,
+    l.ptt_max,
+    l.d_dimer_max,
+    l.fibrinogen_min,
+    l.alt_max,
+    l.ast_max,
+    l.alp_max,
+    l.abs_neutrophils_max,
+    l.abs_lymphocytes_min,
+    l.abs_monocytes_max,
+    l.bands_max
+  FROM `physionet-data.mimiciv_3_1_derived.first_day_lab` l
+  JOIN index_icu_stay iis
+    ON l.stay_id = iis.first_stay_id
+),
+
+gcs AS (
+  SELECT
+    iis.hadm_id,
+    g.gcs_min,
+    g.gcs_motor,
+    g.gcs_verbal,
+    g.gcs_eyes
+  FROM `physionet-data.mimiciv_3_1_derived.first_day_gcs` g
+  JOIN index_icu_stay iis
+    ON g.stay_id = iis.first_stay_id
+),
+
+height_weight AS (
+  SELECT
+    iis.hadm_id,
+    h.height,
+    w.weight_admit,
+    w.weight,
+    SAFE_DIVIDE(
+      w.weight_admit,
+      POW(h.height / 100.0, 2)
+    ) AS bmi_admit
+  FROM `physionet-data.mimiciv_3_1_derived.first_day_height` h
+  JOIN index_icu_stay iis
+    ON h.stay_id = iis.first_stay_id
+  LEFT JOIN `physionet-data.mimiciv_3_1_derived.first_day_weight` w
+    ON h.stay_id = w.stay_id
+),
+
+bg AS (
+  SELECT
+    iis.hadm_id,
+    bg.lactate_max,
+    bg.ph_min,
+    bg.po2_min,
+    bg.pco2_max,
+    bg.pao2fio2ratio_min,
+    bg.baseexcess_min
+  FROM `physionet-data.mimiciv_3_1_derived.first_day_bg` bg
+  JOIN index_icu_stay iis
+    ON bg.stay_id = iis.first_stay_id
+),
+
+sofa AS (
+  SELECT
+    iis.hadm_id,
+    MAX(s.sofa_24hours) AS sofa_score
+  FROM `physionet-data.mimiciv_3_1_derived.sofa` s
+  JOIN index_icu_stay iis
+    ON s.stay_id = iis.first_stay_id
+  WHERE s.hr <= 24
+  GROUP BY iis.hadm_id
+),
+
+sapsii AS (
+  SELECT
+    iis.hadm_id,
+    sa.sapsii
+  FROM `physionet-data.mimiciv_3_1_derived.sapsii` sa
+  JOIN index_icu_stay iis
+    ON sa.stay_id = iis.first_stay_id
+),
+
+charlson AS (
+  SELECT DISTINCT
+    ch.hadm_id,
+    ch.charlson_comorbidity_index,
+    ch.peripheral_vascular_disease,
+    ch.cerebrovascular_disease,
+    ch.dementia,
+    ch.chronic_pulmonary_disease,
+    ch.rheumatic_disease,
+    ch.peptic_ulcer_disease,
+    ch.mild_liver_disease,
+    ch.diabetes_without_cc,
+    ch.diabetes_with_cc,
+    ch.renal_disease,
+    ch.malignant_cancer,
+    ch.severe_liver_disease,
+    ch.metastatic_solid_tumor
+  FROM `physionet-data.mimiciv_3_1_derived.charlson` ch
+  JOIN index_admissions ia
+    ON ch.hadm_id = ia.index_hadm_id
+),
+
+comorbidities AS (
+  SELECT
+    hadm_id,
+
+    MAX(CASE WHEN
+      (icd_version = 9 AND icd_code LIKE '401%')
+      OR (icd_version = 10 AND icd_code LIKE 'I10%')
+    THEN 1 ELSE 0 END) AS hypertension,
+
+    MAX(CASE WHEN
+      (icd_version = 9 AND icd_code LIKE '250%')
+      OR (icd_version = 10 AND (icd_code LIKE 'E10%' OR icd_code LIKE 'E11%'))
+    THEN 1 ELSE 0 END) AS diabetes,
+
+    MAX(CASE WHEN
+      (icd_version = 9 AND icd_code IN ('2720','2721','2722','2724'))
+      OR (icd_version = 10 AND icd_code IN ('E780','E7800','E7801','E781','E782','E785','E7849','E784'))
+    THEN 1 ELSE 0 END) AS hyperlipidemia,
+
+    MAX(CASE WHEN
+      (icd_version = 9 AND icd_code LIKE '42731%')
+      OR (icd_version = 10 AND icd_code LIKE 'I48%')
+    THEN 1 ELSE 0 END) AS af_or_flutter,
+
+    MAX(CASE WHEN
+      (icd_version = 9 AND icd_code LIKE '428%')
+      OR (icd_version = 10 AND icd_code LIKE 'I50%')
+    THEN 1 ELSE 0 END) AS heart_failure,
+
+    MAX(CASE WHEN
+      (icd_version = 9 AND icd_code LIKE '585%')
+      OR (icd_version = 10 AND icd_code LIKE 'N18%')
+    THEN 1 ELSE 0 END) AS ckd,
+
+    MAX(CASE WHEN
+      (icd_version = 9 AND (icd_code LIKE '3051%' OR icd_code LIKE 'V1582%'))
+      OR (icd_version = 10 AND (icd_code LIKE 'F17%' OR icd_code = 'Z87891'))
+    THEN 1 ELSE 0 END) AS smoking,
+
+    MAX(CASE WHEN
+      (icd_version = 9 AND icd_code LIKE '278%')
+      OR (icd_version = 10 AND icd_code LIKE 'E66%')
+    THEN 1 ELSE 0 END) AS obesity,
+
+    MAX(CASE WHEN
+      (icd_version = 9 AND (icd_code LIKE '434%' OR icd_code LIKE '436%'))
+      OR (icd_version = 10 AND icd_code LIKE 'I63%')
+    THEN 1 ELSE 0 END) AS prior_stroke,
+
+    MAX(CASE WHEN
+      (icd_version = 9 AND icd_code IN ('4439','4431','44381','44389','44382'))
+      OR (icd_version = 10 AND icd_code IN ('I739','I731','I7300','I7301','I7381','I7389'))
+    THEN 1 ELSE 0 END) AS pvd
+
+  FROM `physionet-data.mimiciv_3_1_hosp.diagnoses_icd`
+  WHERE hadm_id IN (
+    SELECT index_hadm_id FROM index_admissions
+  )
+  GROUP BY hadm_id
+),
+
+medications AS (
+  SELECT
+    hadm_id,
+
+    MAX(CASE WHEN LOWER(drug) LIKE '%insulin%'
+    THEN 1 ELSE 0 END) AS med_insulin,
+
+    MAX(CASE WHEN
+      LOWER(drug) LIKE '%furosemide%'
+      OR LOWER(drug) LIKE '%bumetanide%'
+      OR LOWER(drug) LIKE '%torsemide%'
+      OR LOWER(drug) LIKE '%hydrochlorothiazide%'
+    THEN 1 ELSE 0 END) AS med_diuretic
+
+  FROM `physionet-data.mimiciv_3_1_hosp.prescriptions`
+  WHERE hadm_id IN (
+    SELECT index_hadm_id FROM index_admissions
+  )
+  GROUP BY hadm_id
+),
+
+mechanical_ventilation AS (
+  SELECT
+    iis.hadm_id,
+    1 AS mechanical_ventilation
+  FROM index_icu_stay iis
+  JOIN `physionet-data.mimiciv_3_1_derived.ventilation` vent
+    ON iis.first_stay_id = vent.stay_id
+  WHERE LOWER(vent.ventilation_status) LIKE '%invasive%'
+  GROUP BY iis.hadm_id
+),
+
+vasopressors AS (
+  SELECT
+    iis.hadm_id,
+    1 AS vasopressor_use
+  FROM index_icu_stay iis
+  JOIN `physionet-data.mimiciv_3_1_icu.inputevents` ie
+    ON iis.first_stay_id = ie.stay_id
+  JOIN `physionet-data.mimiciv_3_1_icu.d_items` di
+    ON ie.itemid = di.itemid
+  WHERE
+    LOWER(di.label) LIKE '%norepinephrine%'
+    OR LOWER(di.label) LIKE '%epinephrine%'
+    OR LOWER(di.label) LIKE '%phenylephrine%'
+    OR LOWER(di.label) LIKE '%vasopressin%'
+    OR LOWER(di.label) LIKE '%dopamine%'
+    OR LOWER(di.label) LIKE '%dobutamine%'
+  GROUP BY iis.hadm_id
+),
+
+renal_replacement AS (
+  SELECT
+    iis.hadm_id,
+    1 AS renal_replacement_therapy
+  FROM index_icu_stay iis
+  JOIN `physionet-data.mimiciv_3_1_icu.procedureevents` pe
+    ON iis.first_stay_id = pe.stay_id
+  JOIN `physionet-data.mimiciv_3_1_icu.d_items` di
+    ON pe.itemid = di.itemid
+  WHERE
+    LOWER(di.label) LIKE '%dialysis%'
+    OR LOWER(di.label) LIKE '%crrt%'
+    OR LOWER(di.label) LIKE '%cvvh%'
+    OR LOWER(di.label) LIKE '%hemofiltration%'
+  GROUP BY iis.hadm_id
+),
+
+icu_interventions AS (
+  SELECT
+    iis.hadm_id,
+    COALESCE(mv.mechanical_ventilation, 0) AS mechanical_ventilation,
+    COALESCE(vp.vasopressor_use, 0) AS vasopressor_use,
+    COALESCE(rrt.renal_replacement_therapy, 0) AS renal_replacement_therapy
+  FROM index_icu_stay iis
+  LEFT JOIN mechanical_ventilation mv
+    ON iis.hadm_id = mv.hadm_id
+  LEFT JOIN vasopressors vp
+    ON iis.hadm_id = vp.hadm_id
+  LEFT JOIN renal_replacement rrt
+    ON iis.hadm_id = rrt.hadm_id
+)
+
+SELECT
+  f.subject_id,
+  f.index_hadm_id,
+  f.index_admittime,
+  f.index_dischtime,
+
+  f.followup_days,
+  mi.days_to_mi,
+  mi.first_future_mi_date,
+  f.dod,
+
+  d.age,
+  d.gender,
+  d.race,
+  d.marital_status,
+  d.insurance,
+  d.admission_type,
+  d.discharge_location,
+  d.los_days,
+
+  pa.num_prior_admissions,
+  pa.num_prior_admissions_1yr,
+  pa.days_since_last_admission,
+  picu.num_prior_icu_stays,
+
+  v.heart_rate_mean,
+  v.heart_rate_max,
+  v.sbp_mean,
+  v.sbp_min,
+  v.dbp_mean,
+  v.dbp_min,
+  v.mbp_mean,
+  v.mbp_min,
+  v.resp_rate_mean,
+  v.resp_rate_max,
+  v.temperature_mean,
+  v.temperature_max,
+  v.spo2_mean,
+  v.spo2_min,
+
+  l.hematocrit_min,
+  l.hemoglobin_min,
+  l.platelets_min,
+  l.wbc_max,
+  l.bicarbonate_min,
+  l.bun_max,
+  l.calcium_min,
+  l.chloride_min,
+  l.creatinine_max,
+  l.glucose_max,
+  l.sodium_min,
+  l.potassium_max,
+  l.aniongap_max,
+  l.albumin_min,
+  l.bilirubin_total_max,
+  l.inr_max,
+  l.pt_max,
+  l.ptt_max,
+  l.d_dimer_max,
+  l.fibrinogen_min,
+  l.alt_max,
+  l.ast_max,
+  l.alp_max,
+  l.abs_neutrophils_max,
+  l.abs_lymphocytes_min,
+  l.abs_monocytes_max,
+  l.bands_max,
+
+  bg.lactate_max,
+  bg.ph_min,
+  bg.po2_min,
+  bg.pco2_max,
+  bg.pao2fio2ratio_min,
+  bg.baseexcess_min,
+
+  g.gcs_min,
+  g.gcs_motor,
+  g.gcs_verbal,
+  g.gcs_eyes,
+
+  hw.height,
+  hw.weight_admit,
+  hw.weight,
+  hw.bmi_admit,
+
+  s.sofa_score,
+  sa.sapsii,
+
+  ch.charlson_comorbidity_index,
+  ch.peripheral_vascular_disease AS charlson_pvd,
+  ch.cerebrovascular_disease,
+  ch.dementia,
+  ch.chronic_pulmonary_disease,
+  ch.rheumatic_disease,
+  ch.peptic_ulcer_disease,
+  ch.mild_liver_disease,
+  ch.diabetes_without_cc,
+  ch.diabetes_with_cc,
+  ch.renal_disease,
+  ch.malignant_cancer,
+  ch.severe_liver_disease,
+  ch.metastatic_solid_tumor,
+
+  co.hypertension,
+  co.diabetes,
+  co.hyperlipidemia,
+  co.af_or_flutter,
+  co.heart_failure,
+  co.ckd,
+  co.smoking,
+  co.obesity,
+  co.prior_stroke,
+  co.pvd,
+
+  COALESCE(m.med_insulin, 0) AS med_insulin,
+  COALESCE(m.med_diuretic, 0) AS med_diuretic,
+
+  COALESCE(ii.mechanical_ventilation, 0) AS mechanical_ventilation,
+  COALESCE(ii.vasopressor_use, 0) AS vasopressor_use,
+  COALESCE(ii.renal_replacement_therapy, 0) AS renal_replacement_therapy
+
+FROM followup f
+LEFT JOIN future_mi mi
+  ON f.index_hadm_id = mi.index_hadm_id
+LEFT JOIN demographics d
+  ON f.index_hadm_id = d.hadm_id
+LEFT JOIN prior_admissions pa
+  ON f.index_hadm_id = pa.index_hadm_id
+LEFT JOIN prior_icu_stays picu
+  ON f.index_hadm_id = picu.index_hadm_id
+LEFT JOIN vitals v
+  ON f.index_hadm_id = v.hadm_id
+LEFT JOIN labs l
+  ON f.index_hadm_id = l.hadm_id
+LEFT JOIN bg
+  ON f.index_hadm_id = bg.hadm_id
+LEFT JOIN gcs g
+  ON f.index_hadm_id = g.hadm_id
+LEFT JOIN height_weight hw
+  ON f.index_hadm_id = hw.hadm_id
+LEFT JOIN sofa s
+  ON f.index_hadm_id = s.hadm_id
+LEFT JOIN sapsii sa
+  ON f.index_hadm_id = sa.hadm_id
+LEFT JOIN charlson ch
+  ON f.index_hadm_id = ch.hadm_id
+LEFT JOIN comorbidities co
+  ON f.index_hadm_id = co.hadm_id
+LEFT JOIN medications m
+  ON f.index_hadm_id = m.hadm_id
+LEFT JOIN icu_interventions ii
+  ON f.index_hadm_id = ii.hadm_id
+
+WHERE f.inpatient_death = 0;
